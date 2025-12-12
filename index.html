@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Waypoint Collector</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css" />
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header {
+      padding: 16px;
+      background: linear-gradient(120deg, #1e293b, #0f172a 60%, #111827);
+      border-bottom: 1px solid #1f2937;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 0.4px;
+    }
+    .controls {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button, .secondary-link {
+      background: #2563eb;
+      color: #e2e8f0;
+      border: none;
+      padding: 10px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: transform 120ms ease, opacity 120ms ease;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button:hover, .secondary-link:hover { transform: translateY(-1px); opacity: 0.9; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+    .secondary-link { background: #0ea5e9; }
+    #map { flex: 1; min-height: 70vh; }
+    .info {
+      padding: 12px 16px;
+      background: #111827;
+      border-top: 1px solid #1f2937;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+    .badge {
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: #1f2937;
+      border: 1px solid #374151;
+      min-width: 160px;
+    }
+    .badge strong { display: block; color: #93c5fd; font-size: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
+    .badge span { display: block; margin-top: 4px; color: #e5e7eb; }
+    .status-ok { color: #4ade80; }
+    .status-warn { color: #fbbf24; }
+    .status-err { color: #f87171; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Waypoint Data Collector</h1>
+    <div class="controls">
+      <button id="save-area">Save Area</button>
+      <button id="generate-waypoint" disabled>Generate Waypoint</button>
+      <button id="reached-waypoint" disabled>Successfully Reached Waypoint</button>
+      <button id="failed-waypoint" disabled>Waypoint Cannot Be Reached</button>
+      <a class="secondary-link" href="saved-data.html">View Saved Data</a>
+    </div>
+  </header>
+
+  <div id="map"></div>
+
+  <div class="info">
+    <div class="badge">
+      <strong>Area of Operation</strong>
+      <span id="area-status" class="status-warn">No polygon set</span>
+    </div>
+    <div class="badge">
+      <strong>Waypoint</strong>
+      <span id="waypoint-status" class="status-warn">None</span>
+    </div>
+    <div class="badge">
+      <strong>Routing</strong>
+      <span id="route-status" class="status-warn">Idle</span>
+    </div>
+    <div class="badge">
+      <strong>Location</strong>
+      <span id="location-status" class="status-warn">Seeking GPS…</span>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.js"></script>
+  <script>
+    const areaStatus = document.getElementById("area-status");
+    const waypointStatus = document.getElementById("waypoint-status");
+    const routeStatus = document.getElementById("route-status");
+    const locationStatus = document.getElementById("location-status");
+
+    const generateBtn = document.getElementById("generate-waypoint");
+    const reachedBtn = document.getElementById("reached-waypoint");
+    const failedBtn = document.getElementById("failed-waypoint");
+    const saveAreaBtn = document.getElementById("save-area");
+
+    const map = L.map("map");
+    const tileLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+    map.setView([0, 0], 2); // fallback view so the map renders even before GPS locks
+
+    let userMarker = null;
+    let userAccuracy = null;
+    let lastUserLatLng = null;
+    let currentWaypointMarker = null;
+    let routingControl = null;
+    let fallbackLine = null;
+    let areaPolygon = null;
+
+    const polygonLayer = new L.FeatureGroup();
+    map.addLayer(polygonLayer);
+
+    const drawControl = new L.Control.Draw({
+      draw: {
+        polygon: {
+          allowIntersection: false,
+          showArea: true,
+          shapeOptions: { color: "#22c55e" }
+        },
+        polyline: false,
+        rectangle: false,
+        circle: false,
+        marker: false,
+        circlemarker: false
+      },
+      edit: {
+        featureGroup: polygonLayer,
+        edit: true,
+        remove: true
+      }
+    });
+    map.addControl(drawControl);
+
+    function updateAreaStatus(hasArea) {
+      if (hasArea) {
+        areaStatus.textContent = "Polygon set";
+        areaStatus.className = "status-ok";
+        generateBtn.disabled = false;
+      } else {
+        areaStatus.textContent = "No polygon set";
+        areaStatus.className = "status-warn";
+        generateBtn.disabled = true;
+      }
+    }
+
+    function updateWaypointStatus(text, statusClass = "status-warn") {
+      waypointStatus.textContent = text;
+      waypointStatus.className = statusClass;
+      const enabled = statusClass !== "status-warn" || text === "Active";
+      reachedBtn.disabled = !currentWaypointMarker;
+      failedBtn.disabled = !currentWaypointMarker;
+    }
+
+    function updateRouteStatus(text, statusClass = "status-warn") {
+      routeStatus.textContent = text;
+      routeStatus.className = statusClass;
+    }
+
+    function updateLocationStatus(text, statusClass = "status-warn") {
+      locationStatus.textContent = text;
+      locationStatus.className = statusClass;
+    }
+
+    function saveAreaToStorage(latlngs) {
+      localStorage.setItem("areaPolygon", JSON.stringify(latlngs));
+    }
+
+    function loadAreaFromStorage() {
+      const data = localStorage.getItem("areaPolygon");
+      if (!data) return;
+      try {
+        const latlngs = JSON.parse(data);
+        const poly = L.polygon(latlngs, { color: "#22c55e" });
+        polygonLayer.addLayer(poly);
+        areaPolygon = poly;
+        map.fitBounds(poly.getBounds());
+        updateAreaStatus(true);
+      } catch (err) {
+        console.error("Failed to load saved polygon", err);
+      }
+    }
+
+    function pointInPolygon(point, vs, eps = 1e-9) {
+      // Ray-casting algorithm with boundary inclusion tolerance.
+      const x = point[0], y = point[1];
+      let inside = false;
+      for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+        const xi = vs[i][0], yi = vs[i][1];
+        const xj = vs[j][0], yj = vs[j][1];
+        // Check if point is on segment
+        const minX = Math.min(xi, xj) - eps, maxX = Math.max(xi, xj) + eps;
+        const minY = Math.min(yi, yj) - eps, maxY = Math.max(yi, yj) + eps;
+        const cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
+        if (Math.abs(cross) <= eps && x >= minX && x <= maxX && y >= minY && y <= maxY) {
+          return true; // on boundary
+        }
+        const intersect = ((yi > y) !== (yj > y)) &&
+          (x < (xj - xi) * (y - yi) / (yj - yi + eps) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    }
+
+    function randomPointInPolygon(latlngs) {
+      // Uniform sampling by triangulating the polygon fan and picking a triangle by area weight.
+      if (latlngs.length < 3) return null;
+      const base = latlngs[0];
+      const triangles = [];
+      let totalArea = 0;
+      for (let i = 1; i < latlngs.length - 1; i++) {
+        const a = base, b = latlngs[i], c = latlngs[i + 1];
+        const area = Math.abs(
+          (a.lng * (b.lat - c.lat) + b.lng * (c.lat - a.lat) + c.lng * (a.lat - b.lat)) / 2
+        );
+        if (area > 0) {
+          totalArea += area;
+          triangles.push({ a, b, c, area: totalArea }); // cumulative
+        }
+      }
+      if (!triangles.length) return null;
+      const r = Math.random() * totalArea;
+      const tri = triangles.find(t => r <= t.area) || triangles[triangles.length - 1];
+      const r1 = Math.random();
+      const r2 = Math.random();
+      const sqrtR1 = Math.sqrt(r1);
+      const lat = (1 - sqrtR1) * tri.a.lat + (sqrtR1 * (1 - r2)) * tri.b.lat + (sqrtR1 * r2) * tri.c.lat;
+      const lng = (1 - sqrtR1) * tri.a.lng + (sqrtR1 * (1 - r2)) * tri.b.lng + (sqrtR1 * r2) * tri.c.lng;
+      return { lat, lng };
+    }
+
+    function clearWaypoint() {
+      if (currentWaypointMarker) {
+        map.removeLayer(currentWaypointMarker);
+        currentWaypointMarker = null;
+      }
+      if (routingControl) {
+        map.removeControl(routingControl);
+        routingControl = null;
+      }
+      if (fallbackLine) {
+        map.removeLayer(fallbackLine);
+        fallbackLine = null;
+      }
+      reachedBtn.disabled = true;
+      failedBtn.disabled = true;
+      updateWaypointStatus("None");
+      updateRouteStatus("Idle");
+    }
+
+    function areaRing() {
+      return areaPolygon ? areaPolygon.getLatLngs()[0].map(p => ({ lat: p.lat, lng: p.lng })) : null;
+    }
+
+    function routeLeavesArea(coords, ring) {
+      if (!ring) return false;
+      const ringPairs = ring.map(p => [p.lng, p.lat]);
+      for (let i = 0; i < coords.length - 1; i++) {
+        const a = coords[i];
+        const b = coords[i + 1];
+        const dist = L.latLng(a).distanceTo(L.latLng(b));
+        const steps = Math.max(2, Math.ceil(dist / 10)); // check every ~10m with boundary tolerance
+        for (let s = 0; s <= steps; s++) {
+          const t = s / steps;
+          const lat = a.lat + (b.lat - a.lat) * t;
+          const lng = a.lng + (b.lng - a.lng) * t;
+          if (!pointInPolygon([lng, lat], ringPairs)) return true;
+        }
+      }
+      return false;
+    }
+
+    function straightLineInsideArea(fromLatLng, toLatLng, ring) {
+      if (!ring) return null;
+      const ringPairs = ring.map(p => [p.lng, p.lat]);
+      const a = { lat: fromLatLng.lat, lng: fromLatLng.lng };
+      const b = { lat: toLatLng.lat, lng: toLatLng.lng };
+      const dist = L.latLng(a).distanceTo(L.latLng(b));
+      const steps = Math.max(2, Math.ceil(dist / 10));
+      const pts = [];
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        const lat = a.lat + (b.lat - a.lat) * t;
+        const lng = a.lng + (b.lng - a.lng) * t;
+        if (!pointInPolygon([lng, lat], ringPairs)) return null;
+        pts.push([lat, lng]);
+      }
+      return pts;
+    }
+
+    function lineInsidePolygon(a, b, ringPairs) {
+      const dist = L.latLng(a).distanceTo(L.latLng(b));
+      const steps = Math.max(2, Math.ceil(dist / 10));
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        const lat = a.lat + (b.lat - a.lat) * t;
+        const lng = a.lng + (b.lng - a.lng) * t;
+        if (!pointInPolygon([lng, lat], ringPairs)) return false;
+      }
+      return true;
+    }
+
+    function buildInAreaPath(fromLatLng, toLatLng, ring) {
+      if (!ring) return null;
+      const ringPairs = ring.map(p => [p.lng, p.lat]);
+      // Nodes: start, end, polygon vertices, centroid, random interior samples
+      const nodes = [];
+      const pushNode = (pt, kind) => nodes.push({ id: nodes.length, lat: pt.lat, lng: pt.lng, kind });
+      pushNode(fromLatLng, "start");
+      pushNode(toLatLng, "end");
+      ring.forEach((p) => pushNode(p, "vertex"));
+      const centroid = polygonCentroid(ring);
+      pushNode(centroid, "centroid");
+      for (let i = 0; i < 12; i++) {
+        const rnd = randomPointInPolygon(ring);
+        if (rnd) pushNode(rnd, "rnd");
+      }
+
+      const adjacency = new Map();
+      nodes.forEach(n => adjacency.set(n.id, []));
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const a = nodes[i], b = nodes[j];
+          if (lineInsidePolygon(a, b, ringPairs)) {
+            const dist = L.latLng(a).distanceTo(L.latLng(b));
+            adjacency.get(a.id).push({ to: b.id, w: dist });
+            adjacency.get(b.id).push({ to: a.id, w: dist });
+          }
+        }
+      }
+
+      // Dijkstra from start (0) to end (1)
+      const distMap = new Map(nodes.map(n => [n.id, Infinity]));
+      const prev = new Map();
+      distMap.set(0, 0);
+      const visited = new Set();
+      while (visited.size < nodes.length) {
+        let current = null;
+        let best = Infinity;
+        distMap.forEach((d, id) => {
+          if (!visited.has(id) && d < best) { best = d; current = id; }
+        });
+        if (current === null || current === 1) break;
+        visited.add(current);
+        const edges = adjacency.get(current) || [];
+        for (const edge of edges) {
+          const nd = distMap.get(current) + edge.w;
+          if (nd < distMap.get(edge.to)) {
+            distMap.set(edge.to, nd);
+            prev.set(edge.to, current);
+          }
+        }
+      }
+      if (!prev.has(1) && distMap.get(1) === Infinity) return null;
+      const path = [];
+      let cur = 1;
+      path.push([nodes[cur].lat, nodes[cur].lng]);
+      while (cur !== 0) {
+        cur = prev.get(cur);
+        if (cur === undefined) break;
+        path.push([nodes[cur].lat, nodes[cur].lng]);
+      }
+      if (path[path.length - 1][0] !== nodes[0].lat || path[path.length - 1][1] !== nodes[0].lng) {
+        path.push([nodes[0].lat, nodes[0].lng]);
+      }
+      return path.reverse();
+    }
+
+    function polygonCentroid(latlngs) {
+      let area = 0, cx = 0, cy = 0;
+      for (let i = 0, j = latlngs.length - 1; i < latlngs.length; j = i++) {
+        const p1 = latlngs[i], p2 = latlngs[j];
+        const f = p1.lng * p2.lat - p2.lng * p1.lat;
+        area += f;
+        cx += (p1.lng + p2.lng) * f;
+        cy += (p1.lat + p2.lat) * f;
+      }
+      area *= 0.5;
+      if (area === 0) return latlngs[0];
+      cx /= (6 * area);
+      cy /= (6 * area);
+      return { lat: cy, lng: cx };
+    }
+
+    function generateRouteCandidates(fromLatLng, toLatLng, ring) {
+      const candidates = [[fromLatLng, toLatLng]];
+      if (!ring) return candidates;
+      const centroid = polygonCentroid(ring);
+      candidates.push([fromLatLng, centroid, toLatLng]);
+      const rnd1 = randomPointInPolygon(ring);
+      if (rnd1) candidates.push([fromLatLng, rnd1, toLatLng]);
+      const rnd2 = randomPointInPolygon(ring);
+      if (rnd1 && rnd2) candidates.push([fromLatLng, rnd1, rnd2, toLatLng]);
+      return candidates;
+    }
+
+    function requestRoute(waypoints) {
+      return new Promise((resolve, reject) => {
+        const control = L.Routing.control({
+          waypoints,
+          show: false,
+          fitSelectedRoutes: true,
+          addWaypoints: false,
+          routeWhileDragging: false,
+        })
+          .on("routesfound", (e) => resolve({ control, routes: e.routes }))
+          .on("routingerror", (err) => {
+            control && map.removeControl(control);
+            reject(err);
+          })
+          .addTo(map);
+      });
+    }
+
+    async function startRouting(fromLatLng, toLatLng) {
+      if (routingControl) {
+        map.removeControl(routingControl);
+        routingControl = null;
+      }
+      if (fallbackLine) {
+        map.removeLayer(fallbackLine);
+        fallbackLine = null;
+      }
+
+      updateRouteStatus("Calculating…", "status-warn");
+      const ring = areaRing();
+      const candidates = generateRouteCandidates(fromLatLng, toLatLng, ring);
+
+      for (const candidate of candidates) {
+        try {
+          const { control, routes } = await requestRoute(candidate);
+          const coords = routes[0].coordinates;
+          if (ring && routeLeavesArea(coords, ring)) {
+            map.removeControl(control);
+            continue;
+          }
+          routingControl = control;
+          updateRouteStatus("Route ready", "status-ok");
+          return;
+        } catch (err) {
+          continue;
+        }
+      }
+
+      // Fallback: draw a straight line if it stays inside the area.
+      const straight = straightLineInsideArea(fromLatLng, toLatLng, ring);
+      if (straight) {
+        fallbackLine = L.polyline(straight, { color: "#f97316", weight: 4, dashArray: "8 8" }).addTo(map);
+        map.fitBounds(fallbackLine.getBounds(), { padding: [24, 24] });
+        updateRouteStatus("Direct line shown (no in-area road route)", "status-warn");
+        return;
+      }
+
+      // If straight line leaves the area, compute an in-polygon path using visibility graph.
+      const polyPath = buildInAreaPath(fromLatLng, toLatLng, ring);
+      if (polyPath && polyPath.length >= 2) {
+        fallbackLine = L.polyline(polyPath, { color: "#f97316", weight: 4, dashArray: "8 8" }).addTo(map);
+        map.fitBounds(fallbackLine.getBounds(), { padding: [24, 24] });
+        updateRouteStatus("In-area path (no roads) shown", "status-warn");
+        return;
+      }
+
+      updateRouteStatus("No in-area route found", "status-err");
+    }
+
+    function logWaypoint(status, note = "") {
+      if (!currentWaypointMarker) return;
+      const waypoint = currentWaypointMarker.getLatLng();
+      const entry = {
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        waypoint: { lat: waypoint.lat, lng: waypoint.lng },
+        status,
+        note,
+        area: areaPolygon ? areaPolygon.getLatLngs()[0].map(p => ({ lat: p.lat, lng: p.lng })) : null
+      };
+      const list = JSON.parse(localStorage.getItem("waypointLog") || "[]");
+      list.push(entry);
+      localStorage.setItem("waypointLog", JSON.stringify(list));
+      updateWaypointStatus(`Logged: ${status}`, status === "reached" ? "status-ok" : "status-err");
+      clearWaypoint();
+    }
+
+    function ensureLocation() {
+      map.locate({ setView: true, watch: true, maxZoom: 17, enableHighAccuracy: true });
+    }
+
+    map.on("locationfound", (e) => {
+      lastUserLatLng = e.latlng;
+      if (!userMarker) {
+        userMarker = L.marker(e.latlng, { title: "You" }).addTo(map);
+      } else {
+        userMarker.setLatLng(e.latlng);
+      }
+      if (!userAccuracy) {
+        userAccuracy = L.circle(e.latlng, e.accuracy / 2, { color: "#38bdf8", weight: 1, fillOpacity: 0.15 }).addTo(map);
+      } else {
+        userAccuracy.setLatLng(e.latlng).setRadius(e.accuracy / 2);
+      }
+      updateLocationStatus("GPS locked", "status-ok");
+    });
+
+    map.on("locationerror", () => {
+      updateLocationStatus("Location unavailable", "status-err");
+      if (areaPolygon) {
+        map.fitBounds(areaPolygon.getBounds());
+      } else {
+        map.setView([37.7749, -122.4194], 12); // default to SF so user sees tiles even if GPS denied
+      }
+    });
+
+    map.on(L.Draw.Event.CREATED, (event) => {
+      polygonLayer.clearLayers();
+      const layer = event.layer;
+      polygonLayer.addLayer(layer);
+      areaPolygon = layer;
+      updateAreaStatus(true);
+    });
+
+    map.on(L.Draw.Event.DELETED, () => {
+      areaPolygon = null;
+      updateAreaStatus(false);
+      clearWaypoint();
+    });
+
+    map.on(L.Draw.Event.EDITED, (e) => {
+      areaPolygon = e.layers.getLayers()[0] || areaPolygon;
+    });
+
+    saveAreaBtn.addEventListener("click", () => {
+      if (!areaPolygon) {
+        alert("Draw an area of operation polygon first.");
+        return;
+      }
+      const latlngs = areaPolygon.getLatLngs()[0].map(p => ({ lat: p.lat, lng: p.lng }));
+      saveAreaToStorage(latlngs);
+      updateAreaStatus(true);
+      alert("Area saved for future sessions.");
+    });
+
+    generateBtn.addEventListener("click", () => {
+      if (!areaPolygon) {
+        alert("Define an area of operation first.");
+        return;
+      }
+      const latlngs = areaPolygon.getLatLngs()[0];
+      const randomPoint = randomPointInPolygon(latlngs);
+      if (!randomPoint) {
+        alert("Could not generate a waypoint inside the polygon. Try a different shape.");
+        return;
+      }
+      clearWaypoint();
+      currentWaypointMarker = L.marker(randomPoint, { icon: L.icon({
+        iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+        iconAnchor: [12, 41]
+      }), title: "Waypoint" }).addTo(map);
+      updateWaypointStatus("Active", "status-ok");
+      reachedBtn.disabled = false;
+      failedBtn.disabled = false;
+      if (lastUserLatLng) {
+        startRouting(lastUserLatLng, randomPoint);
+      } else {
+        updateRouteStatus("Waiting for GPS to route", "status-warn");
+      }
+    });
+
+    reachedBtn.addEventListener("click", () => {
+      logWaypoint("reached");
+    });
+
+    failedBtn.addEventListener("click", () => {
+      const note = prompt("Why can't the waypoint be reached?");
+      logWaypoint("unreachable", note || "");
+    });
+
+    loadAreaFromStorage();
+    updateWaypointStatus("None");
+    ensureLocation();
+  </script>
+</body>
+</html>
